@@ -17,7 +17,7 @@ class Settings(BaseSettings):
     request_timeout_sec: float = Field(default=8.0, alias="REQUEST_TIMEOUT_SEC")
     app_user_agent: str = Field(default="MedIntelQuickPlus/1.0", alias="APP_USER_AGENT")
     cors_origins: list[str] = Field(
-        default_factory=lambda: ["http://localhost:5173"], alias="CORS_ORIGINS"
+       default_factory=lambda: ["*"], alias="CORS_ORIGINS"
     )
 
     model_config = SettingsConfigDict(
