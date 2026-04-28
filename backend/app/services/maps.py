@@ -22,6 +22,23 @@ def haversine_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
     return radius * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 
+def _fallback_nearby_links(lat: float, lng: float) -> list[dict[str, str | float]]:
+    return [
+        {
+            "name": "Search Nearby Pharmacies (Google Maps)",
+            "distance_km": 0.0,
+            "map_link": f"https://www.google.com/maps/search/pharmacy/@{lat},{lng},15z",
+            "address": "Generic Search Link",
+        },
+        {
+            "name": "Search Nearby Pharmacies (OpenStreetMap)",
+            "distance_km": 0.0,
+            "map_link": f"https://www.openstreetmap.org/search?query=pharmacy#map=15/{lat}/{lng}",
+            "address": "Generic Search Link",
+        }
+    ]
+
+
 async def find_nearby_medical_stores(
     lat: float,
     lng: float,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any
 
@@ -11,6 +12,39 @@ GEMINI_API_URL = (
 )
 
 
+def _clean_json_text(text: str) -> str:
+    text = text.strip()
+    if text.startswith("```"):
+        parts = text.split("\n", 1)
+        if len(parts) > 1:
+            text = parts[1]
+    if text.endswith("```"):
+        text = text[:-3]
+    return text.strip()
+
+async def _generate_json(
+    prompt: str,
+    api_key: str | None,
+    model: str,
+    timeout_sec: float,
+) -> Any:
+    last_err = None
+    for _ in range(3):
+        raw_text = await _gemini_request(
+            prompt=prompt,
+            api_key=api_key,
+            model=model,
+            timeout_sec=timeout_sec,
+            response_mime_type="application/json",
+        )
+        cleaned = _clean_json_text(raw_text)
+        try:
+            return json.loads(cleaned)
+        except json.JSONDecodeError as e:
+            last_err = e
+            await asyncio.sleep(1)
+    raise ValueError(f"Gemini returned malformed JSON after retries. Last error: {last_err}")
+
 def _extract_text(payload: dict[str, Any]) -> str:
     candidates = payload.get("candidates", [])
     if not candidates:
@@ -21,31 +55,41 @@ def _extract_text(payload: dict[str, Any]) -> str:
 
 
 async def _gemini_request(
-    prompt: str,
+    prompt: str | None,
     api_key: str | None,
     model: str,
     timeout_sec: float,
     response_mime_type: str,
+    contents: list[dict[str, Any]] | None = None,
 ) -> str:
     if not api_key:
         raise RuntimeError("Gemini API key is missing.")
 
+    if contents is None:
+        contents = [{"role": "user", "parts": [{"text": prompt}]}]
+
     request_payload = {
-        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "contents": contents,
         "generationConfig": {
             "temperature": 0.2,
-            "maxOutputTokens": 800,
+            "maxOutputTokens": 8192,
             "responseMimeType": response_mime_type,
         },
     }
 
-    async with httpx.AsyncClient(timeout=timeout_sec) as client:
-        response = await client.post(
-            GEMINI_API_URL.format(model=model),
-            params={"key": api_key},
-            json=request_payload,
-        )
-        response.raise_for_status()
+    max_retries = 4
+    for attempt in range(max_retries):
+        async with httpx.AsyncClient(timeout=timeout_sec) as client:
+            response = await client.post(
+                GEMINI_API_URL.format(model=model),
+                params={"key": api_key},
+                json=request_payload,
+            )
+            if response.status_code in {429, 500, 502, 503, 504} and attempt < max_retries - 1:
+                await asyncio.sleep(2 ** attempt)
+                continue
+            response.raise_for_status()
+            break
 
     text = _extract_text(response.json())
     if not text:
@@ -69,14 +113,12 @@ async def analyze_medicines(
         f"Inputs: {json.dumps(medicines)}"
     )
 
-    raw_json = await _gemini_request(
+    parsed = await _generate_json(
         prompt=prompt,
         api_key=api_key,
         model=model,
         timeout_sec=timeout_sec,
-        response_mime_type="application/json",
     )
-    parsed = json.loads(raw_json)
     if not isinstance(parsed, list):
         raise ValueError("Invalid analyze response format from Gemini.")
 
@@ -102,22 +144,20 @@ async def generate_alternatives(
 ) -> list[dict[str, Any]]:
     prompt = (
         "You are helping users find cost-saving medicine options in India.\n"
-        "For each generic item below, suggest 2 to 3 commonly available "
-        "alternatives with approximate INR price.\n"
+        "For each generic item below, suggest 2 to 3 commonly available alternatives with approximate INR price.\n"
+        "Also include 'uses' (briefly what the medicine is used for) and 'differences' (key differences like brand/manufacturer or slight formulation differences compared to typical generic).\n"
         "Return JSON only as an array using this shape:\n"
-        '[{"generic":"...", "alternatives":[{"name":"...", "approx_price":12.5}]}]\n'
+        '[{"generic":"...", "alternatives":[{"name":"...", "approx_price":12.5, "uses": "Used for fever...", "differences": "Different manufacturer"}]}]\n'
         "Do not include explanations.\n"
         f"Input: {json.dumps(mappings)}"
     )
 
-    raw_json = await _gemini_request(
+    parsed = await _generate_json(
         prompt=prompt,
         api_key=api_key,
         model=model,
         timeout_sec=timeout_sec,
-        response_mime_type="application/json",
     )
-    parsed = json.loads(raw_json)
     if not isinstance(parsed, list):
         raise ValueError("Invalid alternatives response format from Gemini.")
 
@@ -147,6 +187,8 @@ async def generate_alternatives(
                     "generic": generic,
                     "name": name,
                     "approx_price": round(price, 2),
+                    "uses": alt.get("uses"),
+                    "differences": alt.get("differences"),
                 }
             )
 
@@ -159,25 +201,36 @@ async def answer_medicine_question(
     question: str,
     selected_medicine: str | None,
     mappings: list[dict[str, str]],
+    history: list[dict[str, str]],
     api_key: str | None,
     model: str,
     timeout_sec: float,
 ) -> str:
-    prompt = (
-        "You are a concise medicine explainer for general education.\n"
-        "Answer in 2 to 3 short lines, plain language, max 60 words.\n"
-        "Include a brief caution to consult a doctor for personal advice.\n"
-        f"Selected medicine: {selected_medicine or 'Not selected'}\n"
-        f"Known mappings: {json.dumps(mappings)}\n"
-        f"Question: {question}"
+    prompt_context = (
+        "You are a medicine expert and assistant.\n"
+        "Answer the user's question clearly and concisely, using Markdown for formatting (bolding, lists, etc).\n"
+        "Always include a brief caution to consult a doctor for personal advice if appropriate.\n"
+        f"Selected medicine context: {selected_medicine or 'Not selected'}\n"
+        f"Known mappings context: {json.dumps(mappings)}\n"
+        "If the question doesn't require this context, ignore it."
     )
 
+    contents = []
+    for msg in history:
+        role = msg.get("role", "user")
+        if role == "assistant":
+            role = "model"
+        contents.append({"role": role, "parts": [{"text": msg.get("content", "")}]})
+    
+    contents.append({"role": "user", "parts": [{"text": f"{prompt_context}\n\nQuestion: {question}"}]})
+
     return await _gemini_request(
-        prompt=prompt,
+        prompt=None,
         api_key=api_key,
         model=model,
         timeout_sec=timeout_sec,
         response_mime_type="text/plain",
+        contents=contents,
     )
 
 
@@ -207,14 +260,12 @@ async def medicine_information(
         f"Generic: {generic_name or 'Unknown'}"
     )
 
-    raw_json = await _gemini_request(
+    payload = await _generate_json(
         prompt=prompt,
         api_key=api_key,
         model=model,
         timeout_sec=timeout_sec,
-        response_mime_type="application/json",
     )
-    payload = json.loads(raw_json)
     if not isinstance(payload, dict):
         raise ValueError("Invalid medicine information format from Gemini.")
 

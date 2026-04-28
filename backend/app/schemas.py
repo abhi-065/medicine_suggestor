@@ -32,6 +32,8 @@ class AlternativeItem(BaseModel):
     approx_price: float = Field(ge=0)
     source: str = "PharmEasy Web Search"
     buy_online_links: dict[str, str] = Field(default_factory=dict)
+    uses: Optional[str] = None
+    differences: Optional[str] = None
 
 
 class AlternativesResponse(BaseModel):
@@ -49,10 +51,16 @@ class NearbyResponse(BaseModel):
     stores: list[NearbyStore]
 
 
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+
+
 class ChatRequest(BaseModel):
     question: str = Field(min_length=2, max_length=400)
     selected_medicine: Optional[str] = None
     mappings: list[GenericMapping] = Field(default_factory=list)
+    history: list[ChatMessage] = Field(default_factory=list)
 
 
 class ChatResponse(BaseModel):

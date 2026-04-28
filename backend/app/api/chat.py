@@ -31,6 +31,7 @@ async def chat(
             question=request.question,
             selected_medicine=request.selected_medicine,
             mappings=context_mappings,
+            history=[{"role": msg.role, "content": msg.content} for msg in request.history],
             api_key=settings.gemini_api_key,
             model=settings.gemini_model,
             timeout_sec=settings.request_timeout_sec,
